@@ -1,0 +1,6 @@
+FROM python:3.11-slim
+RUN useradd -m runner
+USER runner
+WORKDIR /home/runner
+COPY run.py /home/runner/run.py
+ENTRYPOINT ["python3", "run.py"]
