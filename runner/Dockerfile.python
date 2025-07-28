@@ -1,6 +1,31 @@
 FROM python:3.11-slim
-RUN useradd -m runner
+
+
+ARG TARGET_UID=1000
+ARG TARGET_GID=1000
+
+# グループが存在しない場合に追加
+RUN set -x \
+    && if ! getent group "$TARGET_GID" >/dev/null; then \
+        addgroup --gid "$TARGET_GID" runnergroup; \
+    fi \
+    && if ! getent passwd "$TARGET_UID" >/dev/null; then \
+        adduser --uid "$TARGET_UID" --ingroup runnergroup --disabled-password --gecos "" runner; \
+    fi
+
+RUN apt-get update && apt-get install -y bash coreutils file procps && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/runner/tmp && chown runner:runnergroup /home/runner/tmp
+WORKDIR /home/runner/tmp
+COPY run.py /home/runner/tmp/run.py
+RUN chmod +x /home/runner/tmp/run.py
 USER runner
-WORKDIR /home/runner
-COPY run.py /home/runner/run.py
-ENTRYPOINT ["python3", "run.py"]
+# ---
+# ▼ここからコンテナレベルのリソース制限（全てDockerfileで明示）
+# CPU/メモリ制限
+ENV PYTHONUNBUFFERED=1
+ENV CONTAINER_MAX_MEM=512m
+ENV CONTAINER_MAX_CPU=1.0
+# ファイルディスクリプタ数制限はdocker run等で指定すること（ulimitはRUN時には無効）
+# cgroupでの制限例（docker build時は無効だが、composeやK8sで有効化可）
+#   --memory=512m --cpus=1.0
+# 必要に応じてENTRYPOINTやCMDで制限付きラッパーを使うことも可

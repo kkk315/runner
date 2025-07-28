@@ -1,8 +1,10 @@
+import os
 import yaml
 import threading
 import time as pytime
 with open(os.path.join(os.path.dirname(__file__), 'config.yaml'), 'r') as f:
     config = yaml.safe_load(f)
+debug_log_keep = config.get('debug_log_keep', False)
 
 # レートリミット用
 rate_limit_per_minute = config.get('rate_limit_per_minute', 30)
@@ -20,8 +22,10 @@ import re
 from dotenv import load_dotenv
 
 
+
 load_dotenv()
 app = FastAPI()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,6 +38,7 @@ app.add_middleware(
 class CodeRequest(BaseModel):
     language: Literal['python', 'node']
     code: str
+    stdin: str = ''
 
 class CodeResponse(BaseModel):
     stdout: str
@@ -63,163 +68,98 @@ def run_code(req: CodeRequest):
     if len(req.code) > max_code_length:
         return CodeResponse(stdout='', stderr='Code too long', exit_code=2003, time=-1, debug={})
     import tempfile
-    client = docker.from_env()
-    image = None
-    command = None
-    ext = None
-    if req.language == 'python':
-        image = os.getenv('RUNNER_PYTHON_IMAGE', 'runner-python')
-        ext = 'py'
-    elif req.language == 'node':
-        image = os.getenv('RUNNER_NODE_IMAGE', 'runner-node')
-        ext = 'js'
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported language")
-
     import shutil
+    client = docker.from_env()
+    # 言語ごとのDockerfileパスをconfig.yamlから取得
+    dockerfiles = config.get('dockerfiles', {})
+    ext_map = {'python': 'py', 'node': 'js'}
+    if req.language not in dockerfiles or req.language not in ext_map:
+        raise HTTPException(status_code=400, detail="Unsupported language")
+    ext = ext_map[req.language]
+    dockerfile_path = os.path.abspath(os.path.join(os.path.dirname(__file__), dockerfiles[req.language]))
+    # 事前ビルド済みイメージを利用
+    image = os.path.basename(dockerfile_path).replace('Dockerfile.', 'runner-')
     tmp_root = os.path.join(os.path.dirname(__file__), 'tmp')
     os.makedirs(tmp_root, exist_ok=True)
     tempdir = tempfile.mkdtemp(prefix='runner-', dir=tmp_root)
-    code_path_host = os.path.join(tempdir, f'code.{ext}')
-    stdout_path_host = os.path.join(tempdir, 'stdout.txt')
-    stderr_path_host = os.path.join(tempdir, 'stderr.txt')
-    time_path_host = os.path.join(tempdir, 'time.txt')
-    with open(code_path_host, 'w') as tmp:
+    os.chmod(tempdir, 0o777)  # 権限問題回避のため一時ディレクトリを全ユーザー書き込み可に
+    # パーミッション確認
+    tempdir_stat = os.stat(tempdir)
+    tempdir_mode = oct(tempdir_stat.st_mode & 0o777)
+    with open(os.path.join(tempdir, f'code.{ext}'), 'w') as tmp:
         tmp.write(req.code)
         tmp.flush()
-    # ディレクトリごとマウント
-    container_tmp_dir = '/home/runner/tmp'
-    code_path_container = os.path.join(container_tmp_dir, f'code.{ext}')
-    stdout_path_container = os.path.join(container_tmp_dir, 'stdout.txt')
-    stderr_path_container = os.path.join(container_tmp_dir, 'stderr.txt')
-    time_path_container = os.path.join(container_tmp_dir, 'time.txt')
+    stdin_data = req.stdin or ''
+    if stdin_data and not stdin_data.endswith('\n'):
+        stdin_data += '\n'
+    with open(os.path.join(tempdir, 'stdin.txt'), 'w') as f:
+        f.write(stdin_data)
+        f.flush()
+    # run.{ext}をtempdirにコピーし、存在チェック
+    host_run = os.path.join(os.path.dirname(__file__), f'../runner/run.{ext}')
+    dest_run = os.path.join(tempdir, f'run.{ext}')
+    shutil.copy2(host_run, dest_run)
+    os.chmod(dest_run, 0o755)
+    if not os.path.exists(dest_run):
+        raise HTTPException(status_code=500, detail=f"run.{ext} not copied to tempdir: {dest_run}")
+    if not os.path.exists(host_run):
+        raise HTTPException(status_code=500, detail=f"host run.{ext} not found: {host_run}")
+    # デバッグ情報として有用な動的値のみを記録
     debug_info = {
-        'host_code_file': code_path_host,
-        'container_code_file': code_path_container,
-        'host_stdout_file': stdout_path_host,
-        'host_stderr_file': stderr_path_host,
-        'host_time_file': time_path_host,
-        'container_stdout_file': stdout_path_container,
-        'container_stderr_file': stderr_path_container,
-        'container_time_file': time_path_container,
-        'host_tmp_dir': tempdir,
-        'container_tmp_dir': container_tmp_dir,
+        'host_tmpdir': os.path.abspath(tempdir),
+        'host_run': os.path.abspath(dest_run),
+        'container_cmd': [f'/home/runner/tmp/run.{ext}', '/home/runner/tmp'],
+        'tempdir_mode': tempdir_mode,
     }
 
+    # debug_log_keepはconfig.yamlの値をそのまま使う
     try:
-        mem_limit = config.get('mem_limit', '512m')
-        cpu_limit = float(config.get('cpu_limit', 1.0))
-        nano_cpus = int(cpu_limit * 1_000_000_000)
+        # 本来のrun.py実行パイプラインに戻す
         container = client.containers.run(
             image,
-            [code_path_container, stdout_path_container, stderr_path_container, time_path_container],
+            [f'python', f'/home/runner/tmp/run.{ext}', '/home/runner/tmp'],
             detach=True,
-            mem_limit=mem_limit,
-            nano_cpus=nano_cpus,
             remove=False,
             tty=False,
             volumes={
-                tempdir: {'bind': container_tmp_dir, 'mode': 'rw'},
-            }
+                tempdir: {'bind': '/home/runner/tmp', 'mode': 'rw'},
+            },
+            working_dir='/home/runner/tmp'
         )
+        result = container.wait()
+        # run.pyが全てのログ・出力ファイルを生成する前提
+        def safe_read(path):
+            try:
+                with open(path, 'r') as f:
+                    return f.read()
+            except Exception:
+                return ''
+        stdout = safe_read(os.path.join(tempdir, 'stdout.txt'))
+        stderr = safe_read(os.path.join(tempdir, 'stderr.txt'))
         try:
-            exit_code = 0
-            max_exec_time = config.get('max_exec_time', 10)
-            try:
-                result = container.wait(timeout=max_exec_time)
-            except Exception as e:
-                # Timeout時はkillして独自エラーコード
-                debug_info['wait_timeout'] = str(e)
-                try:
-                    container.kill()
-                except Exception:
-                    pass
-                result = {'StatusCode': 137}
-                exit_code = 1001  # 独自: タイムアウト
-            # ホスト側ファイルから出力取得
-            try:
-                with open(stdout_path_host, 'r') as f:
-                    stdout = f.read()
-            except Exception:
-                stdout = ''
-            try:
-                with open(stderr_path_host, 'r') as f:
-                    stderr = f.read()
-            except Exception:
-                stderr = ''
-            try:
-                with open(time_path_host, 'r') as f:
-                    exec_time = float(f.read())
-            except Exception:
-                exec_time = -1
-            # 出力はバイト数で制限
-            max_stdout_bytes = config.get('max_stdout_bytes', 1048576)
-            max_stderr_bytes = config.get('max_stderr_bytes', 1048576)
-            output_truncated = False
-            if len(stdout.encode('utf-8')) > max_stdout_bytes:
-                stdout = stdout.encode('utf-8')[:max_stdout_bytes].decode('utf-8', errors='ignore') + '\n... (truncated)'
-                output_truncated = True
-            if len(stderr.encode('utf-8')) > max_stderr_bytes:
-                stderr = stderr.encode('utf-8')[:max_stderr_bytes].decode('utf-8', errors='ignore') + '\n... (truncated)'
-                output_truncated = True
-            if output_truncated and exit_code == 0:
-                exit_code = 1002  # 独自: 出力過多
-            if exit_code == 0:
-                exit_code = result.get('StatusCode', 0)
-            resp = CodeResponse(
-                stdout=stdout,
-                stderr=stderr,
-                exit_code=exit_code,
-                time=exec_time,
-                debug=debug_info
-            )
-            try:
-                container.remove(force=True)
-            except Exception:
-                pass
-            shutil.rmtree(tempdir, ignore_errors=True)
-            return resp
-        except Exception as e:
-            debug_info['container_stderr'] = str(e)
-            try:
-                container.remove(force=True)
-            except Exception:
-                pass
-            try:
-                with open(stdout_path_host, 'r') as f:
-                    stdout = f.read()
-            except Exception:
-                stdout = ''
-            try:
-                with open(stderr_path_host, 'r') as f:
-                    stderr = f.read()
-            except Exception:
-                stderr = ''
-            try:
-                with open(time_path_host, 'r') as f:
-                    exec_time = float(f.read())
-            except Exception:
-                exec_time = -1
-            resp = CodeResponse(stdout=stdout, stderr=stderr, exit_code=1, time=exec_time, debug=debug_info)
-            shutil.rmtree(tempdir, ignore_errors=True)
-            return resp
-    except Exception as e:
-        debug_info['container_stderr'] = str(e)
-        try:
-            with open(stdout_path_host, 'r') as f:
-                stdout = f.read()
-        except Exception:
-            stdout = ''
-        try:
-            with open(stderr_path_host, 'r') as f:
-                stderr = f.read()
-        except Exception:
-            stderr = ''
-        try:
-            with open(time_path_host, 'r') as f:
-                exec_time = float(f.read())
+            exec_time = float(safe_read(os.path.join(tempdir, 'time.txt')))
         except Exception:
             exec_time = -1
-        resp = CodeResponse(stdout=stdout, stderr=stderr, exit_code=1, time=exec_time, debug=debug_info)
-        shutil.rmtree(tempdir, ignore_errors=True)
+        try:
+            exit_code = int(safe_read(os.path.join(tempdir, 'exit_code.txt')))
+        except Exception:
+            exit_code = result.get('StatusCode', 0)
+        resp = CodeResponse(
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=exit_code,
+            time=exec_time,
+            debug=debug_info
+        )
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
+        if not debug_log_keep:
+            shutil.rmtree(tempdir, ignore_errors=True)
+        return resp
+    except Exception as e:
+        resp = CodeResponse(stdout='', stderr=str(e), exit_code=1, time=-1, debug=debug_info)
+        if not debug_log_keep:
+            shutil.rmtree(tempdir, ignore_errors=True)
         return resp

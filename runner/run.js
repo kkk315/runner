@@ -1,16 +1,22 @@
 const fs = require('fs');
 const { performance } = require('perf_hooks');
 
+
 let code = '';
-if (process.argv.length > 2) {
+let stdinData = '';
+if (process.argv.length > 3) {
   code = fs.readFileSync(process.argv[2], 'utf-8');
-  runCode(code);
+  stdinData = fs.readFileSync(process.argv[5], 'utf-8');
+  runCode(code, stdinData);
 } else {
   process.stdin.on('data', chunk => code += chunk);
-  process.stdin.on('end', () => runCode(code));
+  process.stdin.on('end', () => runCode(code, ''));
 }
 
-function runCode(code) {
+function runCode(code, stdinData) {
+  // monkey patch process.stdin
+  const { Readable } = require('stream');
+  process.stdin = Readable.from([stdinData]);
   const start = performance.now();
   try {
     eval(code);

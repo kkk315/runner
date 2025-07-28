@@ -1,0 +1,14 @@
+# VSCode
+.vscode/
+# Python
+backend/__pycache__/
+backend/venv/
+# Node.js (frontend)
+frontend/node_modules/
+# React build output
+frontend/build/
+# 一時ファイル
+backend/tmp/
+# ログ・その他
+*.log
+frontend/asset-manifest.json

@@ -1,3 +1,9 @@
+# 言語ごとのDockerfileパス設定
+dockerfiles:
+  python: ../runner/Dockerfile.python
+  node: ../runner/Dockerfile.node
+# デバッグ用: tmpディレクトリのログを残すかどうか
+debug_log_keep: true
 # 実行環境の制限設定
 
 # 1分間に許可する最大リクエスト数（DoS対策・同時利用制限）

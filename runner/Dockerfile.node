@@ -1,6 +1,6 @@
+
 FROM node:20-slim
 RUN useradd -m runner
 USER runner
-WORKDIR /home/runner
+WORKDIR /home/runner/tmp
 COPY run.js /home/runner/run.js
-ENTRYPOINT ["node", "run.js"]
