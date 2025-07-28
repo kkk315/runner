@@ -1,5 +1,6 @@
 
 import os
+import json
 import yaml
 import threading
 import time as pytime
@@ -172,7 +173,8 @@ def run_code(req: CodeRequest):
             cpu_period=100000,
             cpu_quota=int(100000 * cpu_limit),
             #read_only=ture,  # DB保存に変更後trueにする
-            security_opt=[f"seccomp={os.path.join(os.path.dirname(__file__), 'seccomp-allow.json')}"]
+            # seccompプロファイルをJSON文字列として渡す
+            security_opt=[f"seccomp={json.dumps(json.load(open(os.path.join(os.path.dirname(__file__), 'seccomp-allow.json'))))}"]
         )
         result = container.wait()
         # 実行結果ファイル読み込み
