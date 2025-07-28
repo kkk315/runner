@@ -1,4 +1,29 @@
 import sys, time, os, json
+import resource
+
+# --- リソース制限の設定 ---
+# メモリ制限（CONTAINER_MAX_MEM: 例 '512m'）
+mem_env = os.environ.get('CONTAINER_MAX_MEM', '512m')
+def parse_mem_limit(val):
+    val = val.lower()
+    if val.endswith('g'):
+        return int(float(val[:-1]) * 1024 * 1024 * 1024)
+    if val.endswith('m'):
+        return int(float(val[:-1]) * 1024 * 1024)
+    if val.endswith('k'):
+        return int(float(val[:-1]) * 1024)
+    return int(val)
+mem_limit = parse_mem_limit(mem_env)
+resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+
+# CPU時間制限（CONTAINER_MAX_CPU: 秒数で指定、例 '2'）
+cpu_env = os.environ.get('CONTAINER_MAX_CPU', '1')
+try:
+    cpu_limit = int(float(cpu_env))
+    resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+except Exception:
+    pass
+
 if len(sys.argv) < 2:
     print("Usage: run.py <tmpdir>", file=sys.stderr)
     sys.exit(1)
