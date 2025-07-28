@@ -165,9 +165,14 @@ def run_code(req: CodeRequest):
             remove=False,
             tty=False,
             volumes={
-                tempdir: {'bind': '/home/runner/tmp', 'mode': 'rw'},
+                tempdir: {'bind': '/home/runner/tmp', 'mode': 'rw'}, # DB保存に変更後roにする
             },
-            working_dir='/home/runner/tmp'
+            working_dir='/home/runner/tmp',
+            mem_limit=mem_limit,
+            cpu_period=100000,
+            cpu_quota=int(100000 * cpu_limit),
+            #read_only=ture,  # DB保存に変更後trueにする
+            security_opt=[f"seccomp={os.path.join(os.path.dirname(__file__), 'seccomp-allow.json')}"]
         )
         result = container.wait()
         # 実行結果ファイル読み込み
