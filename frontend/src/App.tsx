@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import CodeEditor from './components/CodeEditor';
+import CodeEditor from './components/CodeEditor.tsx';
 import StdinInput from './components/StdinInput';
 import Layout from './components/Layout';
 import ResultPanel from './components/ResultPanel';

@@ -1,4 +1,5 @@
 import React from 'react';
+// Removed duplicate import and unnecessary type import
 
 type StdinInputProps = {
   stdin: string;
