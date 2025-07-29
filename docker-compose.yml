@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  frontend:
+    image: runner-frontend:latest
+    ports:
+      - "80:80"
+    networks:
+      - frontend-net
+    depends_on:
+      - backend
+    environment:
+      - NODE_ENV=production
+
+  backend:
+    image: runner-backend:latest
+    ports:
+      - "8000:8000"
+    networks:
+      - frontend-net
+      - backend-db-net
+    depends_on:
+      - db
+    environment:
+      - DBUSER_FILE=/run/secrets/DBUSER
+      - DBPASSWORD_FILE=/run/secrets/DBPASSWORD
+      - DBNAME_FILE=/run/secrets/DBNAME
+    secrets:
+      - DBUSER
+      - DBPASSWORD
+      - DBNAME
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  db:
+    image: postgres:16.2
+    restart: always
+    environment:
+      POSTGRES_DB_FILE: /run/secrets/DBNAME
+      POSTGRES_USER_FILE: /run/secrets/DBUSER
+      POSTGRES_PASSWORD_FILE: /run/secrets/DBPASSWORD
+    networks:
+      - backend-db-net
+    secrets:
+      - DBUSER
+      - DBPASSWORD
+      - DBNAME
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+secrets:
+  DBUSER:
+    external: true
+  DBPASSWORD:
+    external: true
+  DBNAME:
+    external: true
+
+networks:
+  frontend-net:
+    driver: overlay
+  backend-db-net:
+    driver: overlay
+    attachable: true
+
+volumes:
+  db-data:

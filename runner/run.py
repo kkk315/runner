@@ -1,55 +1,171 @@
-import sys, time, os, json
-import resource
+#!/usr/bin/env python3
+import sys
+import time
+import os
+import io
+import contextlib
+import traceback
+import yaml
 
-# --- リソース制限の設定 ---
-# メモリ制限（CONTAINER_MAX_MEM: 例 '512m'）
-mem_env = os.environ.get('CONTAINER_MAX_MEM', '512m')
-def parse_mem_limit(val):
-    val = val.lower()
-    if val.endswith('g'):
-        return int(float(val[:-1]) * 1024 * 1024 * 1024)
-    if val.endswith('m'):
-        return int(float(val[:-1]) * 1024 * 1024)
-    if val.endswith('k'):
-        return int(float(val[:-1]) * 1024)
-    return int(val)
-mem_limit = parse_mem_limit(mem_env)
-resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+from sqlalchemy import create_engine, Column, Integer, String, Text, Float
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.exc import SQLAlchemyError
 
-# CPU時間制限（CONTAINER_MAX_CPU: 秒数で指定、例 '2'）
-cpu_env = os.environ.get('CONTAINER_MAX_CPU', '1')
-try:
-    cpu_limit = int(float(cpu_env))
-    resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
-except Exception:
-    pass
+# --- 定数 ---
+# データベース関連（main.pyから環境変数で渡された値のみ使用）
+DB_TABLE_NAME = 'code_jobs'
 
-if len(sys.argv) < 2:
-    print("Usage: run.py <tmpdir>", file=sys.stderr)
-    sys.exit(1)
-tmpdir = sys.argv[1]
-codefile = os.path.join(tmpdir, 'code.py')
-if not os.path.exists(codefile):
-    print("No code.py found in tmpdir", file=sys.stderr)
-    sys.exit(2)
-stdinfile = os.path.join(tmpdir, 'stdin.txt')
-stdoutfile = os.path.join(tmpdir, 'stdout.txt')
-stderrfile = os.path.join(tmpdir, 'stderr.txt')
-timefile = os.path.join(tmpdir, 'time.txt')
-exit_code_file = os.path.join(tmpdir, 'exit_code.txt')
+# ジョブステータス
+JOB_STATUS_DONE = 'done'
+JOB_STATUS_ERROR = 'error'
+JOB_STATUS_PENDING = 'pending'
 
-start = time.time()
-exit_code = 1
-try:
-    cmd = f'{sys.executable} {codefile} < {stdinfile} > {stdoutfile} 2> {stderrfile}'
-    exit_code = os.system(cmd)
-finally:
-    end = time.time()
-    with open(timefile, 'w') as tf:
-        tf.write(str(end-start))
+# --- モデル定義 ---
+Base = declarative_base()
+
+class CodeJob(Base):
+    __tablename__ = DB_TABLE_NAME
+    id = Column(Integer, primary_key=True, index=True)
+    language = Column(String(16))
+    code = Column(Text)
+    stdin = Column(Text)
+    status = Column(String(16), default=JOB_STATUS_PENDING)
+    result_stdout = Column(Text)
+    result_stderr = Column(Text)
+    result_exit_code = Column(Integer)
+    result_time = Column(Float)
+
+# --- ヘルパー関数 ---
+
+# --- ヘルパー関数（不要なので削除） ---
+
+@contextlib.contextmanager
+def redirect_stdout_stderr_stdin(stdout_stream: io.StringIO, stderr_stream: io.StringIO, stdin_stream: io.StringIO):
+    """
+    標準出力、標準エラー出力、標準入力を一時的にリダイレクトするコンテキストマネージャ。
+    """
+    original_stdin, original_stdout, original_stderr = sys.stdin, sys.stdout, sys.stderr
+    sys.stdin = stdin_stream
+    sys.stdout = stdout_stream
+    sys.stderr = stderr_stream
     try:
-        with open(exit_code_file, 'w') as ef:
-            ef.write(str(exit_code))
-    except Exception:
-        pass
+        yield
+    finally:
+        sys.stdin, sys.stdout, sys.stderr = original_stdin, original_stdout, original_stderr
 
+# --- メインロジック ---
+
+def get_db_url(db_user, db_password, db_name, db_host, db_port) -> str:
+    """データベース接続URLを引数から構築する（main.pyから渡された値のみ使用）"""
+    if not all([db_user, db_password, db_name, db_host, db_port]):
+        print("Error: Database connection parameters are incomplete. Exiting.", file=sys.stderr)
+        sys.exit(1)
+    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+def initialize_db(database_url: str):
+    """データベース接続とテーブル作成を行う"""
+    global engine, SessionLocal
+    engine = create_engine(database_url)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    
+    try:
+        Base.metadata.create_all(bind=engine)
+    except SQLAlchemyError as e:
+        print(f"Error: Failed to connect to database or create tables: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def execute_code_in_memory(code_str: str, stdin_data: str) -> tuple[str, str, int, float]:
+    """
+    メモリ上でPythonコードを実行し、標準入出力と実行時間、終了コードをキャプチャする。
+    """
+    stdout_stream = io.StringIO()
+    stderr_stream = io.StringIO()
+    stdin_stream = io.StringIO(stdin_data)
+    
+    exit_code = 0
+    start_time = time.time()
+
+    with redirect_stdout_stderr_stdin(stdout_stream, stderr_stream, stdin_stream):
+        try:
+            exec(code_str, {})
+        except Exception:
+            stderr_stream.write(traceback.format_exc())
+            exit_code = 1
+
+    end_time = time.time()
+    
+    return (
+        stdout_stream.getvalue(),
+        stderr_stream.getvalue(),
+        exit_code,
+        end_time - start_time
+    )
+
+def main():
+    """スクリプトのメイン実行ロジック"""
+    if len(sys.argv) < 7:
+        print("Usage: python runner.py <job_id> <db_user> <db_password> <db_name> <db_host> <db_port>", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        job_id = int(sys.argv[1])
+        db_user = sys.argv[2]
+        db_password = sys.argv[3]
+        db_name = sys.argv[4]
+        db_host = sys.argv[5]
+        db_port = sys.argv[6]
+    except Exception:
+        print("Error: Invalid arguments.", file=sys.stderr)
+        sys.exit(1)
+
+    db_url = get_db_url(db_user, db_password, db_name, db_host, db_port)
+    initialize_db(db_url)
+
+    db: Session | None = None
+    try:
+        db = SessionLocal()
+        job = db.query(CodeJob).filter(CodeJob.id == job_id).first()
+
+        if not job:
+            print(f"Error: Job with ID {job_id} not found in database.", file=sys.stderr)
+            sys.exit(1)
+
+        # DB接続後、ユーザーコード実行前にstatusを"TEST"に更新してcommit
+        job.status = "TEST"
+        try:
+            db.commit()
+            print(f"DB status TEST commit success for job_id={job_id}", file=sys.stderr)
+        except Exception as e:
+            print(f"DB status TEST commit failed for job_id={job_id}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # コード実行
+        stdout_result, stderr_result, exit_code_result, time_result = \
+            execute_code_in_memory(job.code, job.stdin or '')
+
+        # 結果をDBに保存
+        job.result_stdout = stdout_result
+        job.result_stderr = stderr_result
+        job.result_exit_code = exit_code_result
+        job.result_time = time_result
+        job.status = JOB_STATUS_DONE if exit_code_result == 0 else JOB_STATUS_ERROR
+
+        db.commit()
+
+    except SQLAlchemyError as e:
+        print(f"Error: Database error while processing job {job_id}: {e}", file=sys.stderr)
+        if db:
+            db.rollback()
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: An unexpected error occurred while processing job {job_id}: {e}", file=sys.stderr)
+        if db:
+            db.rollback()
+        sys.exit(1)
+    finally:
+        if db:
+            db.close()
+
+if __name__ == "__main__":
+    main()

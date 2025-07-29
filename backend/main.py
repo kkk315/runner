@@ -1,15 +1,20 @@
-
 import os
 import json
 import yaml
 import threading
 import time as pytime
 from fastapi import FastAPI, HTTPException
+from models import CodeJob
+from db import SessionLocal
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Literal
 import docker
 from dotenv import load_dotenv
+import logging
+import sys
+logger = logging.getLogger("uvicorn.error")
+logger.setLevel(logging.INFO)
 
 load_dotenv()
 app = FastAPI()
@@ -62,37 +67,6 @@ def check_code_length(code: str) -> bool:
     max_code_length = config.get('max_code_length', 10000)
     return len(code) <= max_code_length
 
-def prepare_tempdir(ext: str, code: str, stdin: str) -> str:
-    # 一時ディレクトリを作成し、コード・標準入力・実行ファイル(run.py/js)を配置
-    import tempfile
-    import shutil
-    # 一時ディレクトリ作成
-    tmp_root = os.path.join(os.path.dirname(__file__), 'tmp')
-    os.makedirs(tmp_root, exist_ok=True)
-    tempdir = tempfile.mkdtemp(prefix='runner-', dir=tmp_root)
-    os.chmod(tempdir, 0o777)
-    # ユーザーコード保存
-    with open(os.path.join(tempdir, f'code.{ext}'), 'w') as tmp:
-        tmp.write(code)
-        tmp.flush()
-    # 標準入力保存
-    stdin_data = stdin or ''
-    if stdin_data and not stdin_data.endswith('\n'):
-        stdin_data += '\n'
-    with open(os.path.join(tempdir, 'stdin.txt'), 'w') as f:
-        f.write(stdin_data)
-        f.flush()
-    # 実行ファイル(run.py/js)をコピー
-    host_run = os.path.join(os.path.dirname(__file__), f'../runner/run.{ext}')
-    dest_run = os.path.join(tempdir, f'run.{ext}')
-    shutil.copy2(host_run, dest_run)
-    os.chmod(dest_run, 0o755)
-    # コピー・存在チェック
-    if not os.path.exists(dest_run):
-        raise HTTPException(status_code=500, detail=f"run.{ext} not copied to tempdir: {dest_run}")
-    if not os.path.exists(host_run):
-        raise HTTPException(status_code=500, detail=f"host run.{ext} not found: {host_run}")
-    return tempdir
 
 def get_resource_limits(image):
     # Dockerイメージの環境変数からメモリ・CPU制限値を取得
@@ -120,216 +94,194 @@ def safe_read(path):
             return f.read()
     except Exception:
         return ''
+@app.get("/")
+def root():
+    return {"status": "OK"}
+ 
 
 @app.post("/run", response_model=CodeResponse)
 def run_code(req: CodeRequest):
-    """
-    コード実行APIエンドポイント
-    - レートリミット・サイズ・長さチェック
-    - 一時ディレクトリ準備
-    - Dockerコンテナでコード実行
-    - 実行結果（stdout/stderr/exit_code/time）を返却
-    """
     if not check_rate_limit():
         return CodeResponse(stdout='', stderr='Rate limit exceeded', exit_code=2001, time=-1, debug={})
     if not check_request_size(req.code):
         return CodeResponse(stdout='', stderr='Request body too large', exit_code=2002, time=-1, debug={})
     if not check_code_length(req.code):
         return CodeResponse(stdout='', stderr='Code too long', exit_code=2003, time=-1, debug={})
-    # 言語・Dockerイメージ・拡張子の決定
-    ext_map = {'python': 'py', 'node': 'js'}
-    dockerfiles = config.get('dockerfiles', {})
-    if req.language not in dockerfiles or req.language not in ext_map:
-        raise HTTPException(status_code=400, detail="Unsupported language")
-    ext = ext_map[req.language]
-    dockerfile_path = os.path.abspath(os.path.join(os.path.dirname(__file__), dockerfiles[req.language]))
-    image_name = os.path.basename(dockerfile_path).replace('Dockerfile.', 'runner-')
+    # DBにジョブ保存
+    db = SessionLocal()
+    job = CodeJob(language=req.language, code=req.code, stdin=req.stdin, status='pending')
+    db.add(job)
+    try:
+        db.commit()
+    except Exception as e:
+        logger.error(f'db commit error: {e}', exc_info=True)
+        db.close()
+        return CodeResponse(stdout='', stderr='db commit error', exit_code=9005, time=-1, debug={})
+    try:
+        db.refresh(job)
+    except Exception as e:
+        logger.error(f'db refresh error: {e}', exc_info=True)
+    try:
+        db.close()
+    except Exception as e:
+        logger.error(f'db close error: {e}', exc_info=True)
+
+    logger.info(f'run_code: job_id={job.id} start (logger)')
+    logging.info(f'run_code: job_id={job.id} start (logging)')
     client = docker.from_env()
-    image = client.images.get(image_name)
-    # 一時ディレクトリ・ファイル準備
-    tempdir = prepare_tempdir(ext, req.code, req.stdin)
-    # リソース制限取得
-    mem_limit, cpu_limit = get_resource_limits(image)
-    # デバッグ情報（返却用）
-    debug_info = {
-        'host_tmpdir': os.path.abspath(tempdir),
-        'host_run': os.path.abspath(os.path.join(tempdir, f'run.{ext}')),
-        'container_cmd': [f'/home/runner/tmp/run.{ext}', '/home/runner/tmp'],
-        'tempdir_mode': oct(os.stat(tempdir).st_mode & 0o777),
+    image = f"runner-{req.language}:latest"
+    mem_limit, cpu_limit = get_resource_limits(client.images.get(image))
+    if not cpu_limit or cpu_limit <= 0:
+        cpu_limit = 1.0
+    seccomp_path = os.path.join(os.path.dirname(__file__), '../runner/seccomp_profile.json')
+    security_opt = None
+    if os.path.exists(seccomp_path):
+        with open(seccomp_path, 'r') as f:
+            seccomp_json = f.read()
+        security_opt = [f"seccomp={seccomp_json}"]
+    host_config = client.api.create_host_config(
+        network_mode='runner_backend-db-net',  # Swarm overlayネットワークを明示指定
+        mem_limit=mem_limit,
+        nano_cpus=int(cpu_limit * 1e9),
+        #security_opt=security_opt
+    )
+    ext_map = {
+        'python': 'py',
+        'node': 'js',
+        # 必要に応じて他言語追加
     }
+    ext = ext_map.get(req.language, req.language)
+    start = pytime.time()
+    logger.info(f'run_code: job_id={job.id} before create_container')
+
+    def read_secret(path, default):
+        try:
+            with open(path, 'r') as f:
+                return f.read().strip()
+        except Exception:
+            return default
+
+    db_user = read_secret('/run/secrets/DBUSER', 'exampleuser')
+    db_password = read_secret('/run/secrets/DBPASSWORD', 'examplepass')
+    db_name = read_secret('/run/secrets/DBNAME', 'exampledb')
+    db_host = 'db'  # HOST名は必ずサービス名 'db' を使う
+    db_port = '5432'
+    logger.info(f"run_code: DB info user={db_user} pass={db_password} name={db_name} host={db_host} port={db_port}")
     try:
-        # Dockerコンテナでコード実行
-        container = client.containers.run(
-            image_name,
-            ['python', f'/home/runner/tmp/run.{ext}', '/home/runner/tmp'],
-            detach=True,
-            remove=False,
-            tty=False,
-            volumes={
-                tempdir: {'bind': '/home/runner/tmp', 'mode': 'rw'}, # DB保存に変更後roにする
-            },
-            working_dir='/home/runner/tmp',
-            mem_limit=mem_limit,
-            cpu_period=100000,
-            cpu_quota=int(100000 * cpu_limit),
-            #read_only=ture,  # DB保存に変更後trueにする
-            # seccompプロファイルをJSON文字列として渡す
-            security_opt=[f"seccomp={json.dumps(json.load(open(os.path.join(os.path.dirname(__file__), 'seccomp-allow.json'))))}"]
+        cmd_str = " ".join([str(x) for x in [job.id, db_user, db_password, db_name, db_host, db_port]])
+        container = client.api.create_container(
+            image=image,
+            entrypoint=f"./run.{ext}",
+            command=cmd_str,
+            host_config=host_config,
+            detach=True
         )
-        result = container.wait()
-        # 実行結果ファイル読み込み
-        stdout = safe_read(os.path.join(tempdir, 'stdout.txt'))
-        stderr = safe_read(os.path.join(tempdir, 'stderr.txt'))
-        try:
-            exec_time = float(safe_read(os.path.join(tempdir, 'time.txt')))
-        except Exception:
-            exec_time = -1
-        try:
-            exit_code = int(safe_read(os.path.join(tempdir, 'exit_code.txt')))
-        except Exception:
-            exit_code = result.get('StatusCode', 0)
-        resp = CodeResponse(
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=exit_code,
-            time=exec_time,
-            debug=debug_info
-        )
-        # コンテナ・一時ディレクトリの後始末
-        try:
-            container.remove(force=True)
-        except Exception:
-            pass
-        if not debug_log_keep:
-            import shutil
-            shutil.rmtree(tempdir, ignore_errors=True)
-        return resp
+        logger.info(f'run_code: job_id={job.id} after create_container')
     except Exception as e:
-        # エラー時のレスポンス生成・後始末
-        resp = CodeResponse(stdout='', stderr=str(e), exit_code=1, time=-1, debug=debug_info)
-        if not debug_log_keep:
-            import shutil
-            shutil.rmtree(tempdir, ignore_errors=True)
-        return resp
+        return CodeResponse(stdout='', stderr=f'create_container error: {str(e)}', exit_code=9001, time=-1, debug={'job_id': job.id})
 
-
-@app.post("/run", response_model=CodeResponse)
-def run_code(req: CodeRequest):
-    # レートリミット
-    now = pytime.time()
-    with rate_limit_lock:
-        rate_limit_times[:] = [t for t in rate_limit_times if now-t < 60]
-        if len(rate_limit_times) >= rate_limit_per_minute:
-            return CodeResponse(stdout='', stderr='Rate limit exceeded', exit_code=2001, time=-1, debug={})
-        rate_limit_times.append(now)
-
-    # リクエストサイズ制限
-    max_request_body_size = config.get('max_request_body_size', 1048576)
-    if req.code and len(req.code.encode('utf-8')) > max_request_body_size:
-        return CodeResponse(stdout='', stderr='Request body too large', exit_code=2002, time=-1, debug={})
-
-    # コード長制限
-    max_code_length = config.get('max_code_length', 10000)
-    if len(req.code) > max_code_length:
-        return CodeResponse(stdout='', stderr='Code too long', exit_code=2003, time=-1, debug={})
-    import tempfile
-    import shutil
-    client = docker.from_env()
-    # 言語ごとのDockerfileパスをconfig.yamlから取得
-    dockerfiles = config.get('dockerfiles', {})
-    ext_map = {'python': 'py', 'node': 'js'}
-    if req.language not in dockerfiles or req.language not in ext_map:
-        raise HTTPException(status_code=400, detail="Unsupported language")
-    ext = ext_map[req.language]
-    dockerfile_path = os.path.abspath(os.path.join(os.path.dirname(__file__), dockerfiles[req.language]))
-    # 事前ビルド済みイメージを利用
-    image = os.path.basename(dockerfile_path).replace('Dockerfile.', 'runner-')
-    tmp_root = os.path.join(os.path.dirname(__file__), 'tmp')
-    os.makedirs(tmp_root, exist_ok=True)
-    tempdir = tempfile.mkdtemp(prefix='runner-', dir=tmp_root)
-    
-    # 環境変数から実際の制限を行う
-    image_env = image.attrs.get('Config', {}).get('Env', [])
-
-    mem_limit = None
-    cpu_limit = None
-
-    for env_var in image_env:
-        if env_var.startswith('CONTAINER_MAX_MEM='):
-            mem_limit = env_var.split('=')[1]
-        elif env_var.startswith('CONTAINER_MAX_CPU='):
-            cpu_limit = float(env_var.split('=')[1]) # floatに変換
-            
-            
-    if not mem_limit :
-        mem_limit = '512m'  # デフォルト値
-    if not cpu_limit:
-        cpu_limit = 1.0  # デフォルト値
-    # パーミッション確認
-    with open(os.path.join(tempdir, f'code.{ext}'), 'w') as tmp:
-        tmp.write(req.code)
-        tmp.flush()
-    stdin_data = req.stdin or ''
-    if stdin_data and not stdin_data.endswith('\n'):
-        stdin_data += '\n'
-    with open(os.path.join(tempdir, 'stdin.txt'), 'w') as f:
-        f.write(stdin_data)
-        f.flush()
-    # run.{ext}をtempdirにコピーし、存在チェック
-    host_run = os.path.join(os.path.dirname(__file__), f'../runner/run.{ext}')
-    dest_run = os.path.join(tempdir, f'run.{ext}')
-    shutil.copy2(host_run, dest_run)
-
-    # debug_log_keepはconfig.yamlの値をそのまま使う
+    logger.info(f'run_code: job_id={job.id} before start_container')
     try:
-        # 本来のrun.py実行パイプラインに戻す
-        container = client.containers.run(
-            image,
-            [f'python', f'/home/runner/tmp/run.{ext}', '/home/runner/tmp'],
-            detach=True,
-            remove=False,
-            tty=False,
-            volumes={
-                tempdir: {'bind': '/home/runner/tmp', 'mode': 'rw'},
-            },
-            working_dir='/home/runner/tmp',
-            mem_limit=mem_limit,
-            cpu_limit=cpu_limit,
-        )
-        result = container.wait()
-        # run.pyが全てのログ・出力ファイルを生成する前提
-        def safe_read(path):
-            try:
-                with open(path, 'r') as f:
-                    return f.read()
-            except Exception:
-                return ''
-        stdout = safe_read(os.path.join(tempdir, 'stdout.txt'))
-        stderr = safe_read(os.path.join(tempdir, 'stderr.txt'))
-        try:
-            exec_time = float(safe_read(os.path.join(tempdir, 'time.txt')))
-        except Exception:
-            exec_time = -1
-        try:
-            exit_code = int(safe_read(os.path.join(tempdir, 'exit_code.txt')))
-        except Exception:
-            exit_code = result.get('StatusCode', 0)
-        resp = CodeResponse(
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=exit_code,
-            time=exec_time,
-            debug=debug_info
-        )
-        try:
-            container.remove(force=True)
-        except Exception:
-            pass
-        if not debug_log_keep:
-            shutil.rmtree(tempdir, ignore_errors=True)
-        return resp
+        container_id = container.get('Id')
+        client.api.start(container_id)
     except Exception as e:
-        resp = CodeResponse(stdout='', stderr=str(e), exit_code=1, time=-1, debug=debug_info)
-        if not debug_log_keep:
-            shutil.rmtree(tempdir, ignore_errors=True)
-        return resp
+        logger.error(f'start_container error: {e}', exc_info=True)
+        return CodeResponse(stdout='', stderr='start_container error', exit_code=9002, time=-1, debug={'job_id': job.id})
+
+    logger.info(f'run_code: job_id={job.id} before get_container')
+    try:
+        container_obj = client.containers.get(container_id)
+        logger.info(f'run_code: job_id={job.id} after get_container')
+        container_obj.wait(timeout=60)
+        logger.info(f'run_code: job_id={job.id} after wait_container')
+    except Exception as e:
+        logger.error(f'wait_container error: {e}', exc_info=True)
+        return CodeResponse(stdout='', stderr='wait_container error', exit_code=9003, time=-1, debug={'job_id': job.id})
+    # client.api.remove_container(container_id, force=True)  # 削除せず残す
+
+    logger.info(f'run_code: job_id={job.id} before db_result')
+    try:
+        db = SessionLocal()
+        job_result = db.query(CodeJob).filter(CodeJob.id == job.id).first()
+        db.close()
+        logger.info(f'run_code: job_id={job.id} after db_result')
+        if job_result:
+            return CodeResponse(
+                stdout=job_result.result_stdout or '',
+                stderr=job_result.result_stderr or '',
+                exit_code=job_result.result_exit_code if job_result.result_exit_code is not None else -1,
+                time=job_result.result_time if job_result.result_time is not None else -1,
+                debug={'job_id': job.id, 'container_id': container_id}
+            )
+        else:
+            return CodeResponse(stdout='', stderr='No result in DB', exit_code=9999, time=-1, debug={'job_id': job.id, 'container_id': container_id})
+    except Exception as e:
+        logger.error(f'db_result error: {e}', exc_info=True)
+        return CodeResponse(stdout='', stderr='db_result error', exit_code=9004, time=-1, debug={'job_id': job.id, 'container_id': container_id})
+
+@app.get("/dbtest", response_model=CodeResponse)
+def dbtest():
+    """
+    DB接続テスト用APIエンドポイント
+    - DB接続可否のみ判定し、結果を返す
+    """
+    try:
+        db = SessionLocal()
+        from sqlalchemy import text
+        db.execute(text('SELECT 1'))
+        db.close()
+        return CodeResponse(stdout='DB接続OK', stderr='', exit_code=0, time=0, debug={})
+    except Exception as e:
+        return CodeResponse(stdout='', stderr=str(e), exit_code=1, time=0, debug={})
+
+# --- DB操作を1ステップずつ分離したテスト用エンドポイント ---
+@app.get("/testA", response_model=CodeResponse)
+def testA():
+    """
+    DB接続のみテスト
+    """
+    try:
+        db = SessionLocal()
+        from sqlalchemy import text
+        db.execute(text('SELECT 1'))
+        db.close()
+        return CodeResponse(stdout='DB接続OK', stderr='', exit_code=0, time=0, debug={})
+    except Exception as e:
+        return CodeResponse(stdout='', stderr=str(e), exit_code=1, time=0, debug={})
+
+@app.get("/testB", response_model=CodeResponse)
+def testB():
+    """
+    DB書き込みのみテスト（code_jobsにダミー追加）
+    """
+    try:
+        db = SessionLocal()
+        from models import CodeJob
+        job = CodeJob(language='python', code='print(1)', stdin='', status='pending')
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        db.close()
+        return CodeResponse(stdout=f'書き込みOK: job_id={job.id}', stderr='', exit_code=0, time=0, debug={})
+    except Exception as e:
+        return CodeResponse(stdout='', stderr=str(e), exit_code=2, time=0, debug={})
+
+@app.get("/testC", response_model=CodeResponse)
+def testC():
+    """
+    DB読み込みのみテスト（最新ジョブ取得）
+    """
+    try:
+        db = SessionLocal()
+        from models import CodeJob
+        job = db.query(CodeJob).order_by(CodeJob.id.desc()).first()
+        db.close()
+        if job:
+            return CodeResponse(stdout=f'id={job.id}, status={job.status}', stderr='', exit_code=0, time=0, debug={})
+        else:
+            return CodeResponse(stdout='', stderr='No job found', exit_code=3, time=0, debug={})
+    except Exception as e:
+        return CodeResponse(stdout='', stderr=str(e), exit_code=3, time=0, debug={})
+
+
+

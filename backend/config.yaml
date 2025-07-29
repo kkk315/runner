@@ -25,7 +25,12 @@ max_exec_time: 10  # 例: 10秒
 max_request_body_size: 1048576  # 例: 1MB = 1048576
 
 # コンテナに割り当てる最大メモリ量（Dockerのmem_limit形式）
-mem_limit: 512m  # 例: 512m, 1g
+mem_limit: 2g  # 例: 512m, 1g, 2g
 
 # コンテナに割り当てる最大CPUコア数（1.0=1コア、0.5=半コア）
 cpu_limit: 1.0  # 例: 1.0, 0.5
+db_host: db
+db_port: 5432
+db_user: youruser
+db_password: yourpassword
+db_name: yourdbname

@@ -59,7 +59,7 @@ function App() {
     setLoading(true);
     setResult(null);
     try {
-      const res = await fetch('http://localhost:8000/run', {
+      const res = await fetch('http://192.168.10.41:8000/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ language, code, stdin })
