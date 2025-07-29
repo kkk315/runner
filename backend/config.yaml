@@ -29,6 +29,8 @@ mem_limit: 2g  # 例: 512m, 1g, 2g
 
 # コンテナに割り当てる最大CPUコア数（1.0=1コア、0.5=半コア）
 cpu_limit: 1.0  # 例: 1.0, 0.5
+
+#テスト用DB接続設定
 db_host: db
 db_port: 5432
 db_user: youruser

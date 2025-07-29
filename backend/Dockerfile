@@ -1,3 +1,6 @@
+# リソース制限環境変数（backend用）
+ENV CONTAINER_MAX_MEM=512m
+ENV CONTAINER_MAX_CPU=1.0
 # backend Dockerfile
 FROM python:3.12-slim
 WORKDIR /app

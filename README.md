@@ -25,6 +25,12 @@ chmod +x register-secrets.sh
 ./register-secrets.sh
 ```
 
+### 3.ネットワーク作成
+swarm外からコード実行用コンテナが参加できるよう、アタッチ可能なネットワークを事前に作成します。
+```
+docker network create --driver overlay --attachable runner_backend-db-net
+```
+
 
 ### Swarm（本番環境）停止・開始
 
@@ -37,19 +43,18 @@ docker stack rm runner
 docker stack deploy -c docker-compose.yml runner
 ```
 
-### 開発環境起動
-#### compose開始
+### 開発環境起動（ホスト）
+#### フロントエンド
 ```bash
-docker compose -f docker-compose.dev.yml up -d
+cd frontend/
+npm start
 ```
-#### compose停止
+#### バックエンド
 ```bash
-docker compose -f docker-compose.dev.yml down
+cd backend
+source venv/bin/activate
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
-
-※本番は `docker-compose.yml`、開発は `docker-compose.dev.yml` を使用
-※開発composeはsecrets不要、DBはdev用設定
-※ネットワークはbridge、ポートはローカル向け
 
 ### runnerビルド
 ```bash

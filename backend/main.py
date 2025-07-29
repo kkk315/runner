@@ -126,8 +126,7 @@ def run_code(req: CodeRequest):
     except Exception as e:
         logger.error(f'db close error: {e}', exc_info=True)
 
-    logger.info(f'run_code: job_id={job.id} start (logger)')
-    logging.info(f'run_code: job_id={job.id} start (logging)')
+
     client = docker.from_env()
     image = f"runner-{req.language}:latest"
     mem_limit, cpu_limit = get_resource_limits(client.images.get(image))
@@ -140,19 +139,17 @@ def run_code(req: CodeRequest):
             seccomp_json = f.read()
         security_opt = [f"seccomp={seccomp_json}"]
     host_config = client.api.create_host_config(
-        network_mode='runner_backend-db-net',  # Swarm overlayネットワークを明示指定
+        network_mode='runner_backend-db-net',  
         mem_limit=mem_limit,
         nano_cpus=int(cpu_limit * 1e9),
-        #security_opt=security_opt
+        security_opt=security_opt
     )
     ext_map = {
         'python': 'py',
         'node': 'js',
-        # 必要に応じて他言語追加
     }
     ext = ext_map.get(req.language, req.language)
     start = pytime.time()
-    logger.info(f'run_code: job_id={job.id} before create_container')
 
     def read_secret(path, default):
         try:
@@ -166,7 +163,6 @@ def run_code(req: CodeRequest):
     db_name = read_secret('/run/secrets/DBNAME', 'exampledb')
     db_host = 'db'  # HOST名は必ずサービス名 'db' を使う
     db_port = '5432'
-    logger.info(f"run_code: DB info user={db_user} pass={db_password} name={db_name} host={db_host} port={db_port}")
     try:
         cmd_str = " ".join([str(x) for x in [job.id, db_user, db_password, db_name, db_host, db_port]])
         container = client.api.create_container(
@@ -176,48 +172,38 @@ def run_code(req: CodeRequest):
             host_config=host_config,
             detach=True
         )
-        logger.info(f'run_code: job_id={job.id} after create_container')
     except Exception as e:
-        return CodeResponse(stdout='', stderr=f'create_container error: {str(e)}', exit_code=9001, time=-1, debug={'job_id': job.id})
+        return CodeResponse(stdout='', stderr=f'create_container error: {str(e)}', exit_code=9001, time=-1, debug={})
 
-    logger.info(f'run_code: job_id={job.id} before start_container')
     try:
         container_id = container.get('Id')
         client.api.start(container_id)
     except Exception as e:
-        logger.error(f'start_container error: {e}', exc_info=True)
-        return CodeResponse(stdout='', stderr='start_container error', exit_code=9002, time=-1, debug={'job_id': job.id})
+        return CodeResponse(stdout='', stderr='start_container error', exit_code=9002, time=-1, debug={})
 
-    logger.info(f'run_code: job_id={job.id} before get_container')
     try:
         container_obj = client.containers.get(container_id)
-        logger.info(f'run_code: job_id={job.id} after get_container')
         container_obj.wait(timeout=60)
-        logger.info(f'run_code: job_id={job.id} after wait_container')
     except Exception as e:
-        logger.error(f'wait_container error: {e}', exc_info=True)
-        return CodeResponse(stdout='', stderr='wait_container error', exit_code=9003, time=-1, debug={'job_id': job.id})
-    # client.api.remove_container(container_id, force=True)  # 削除せず残す
-
-    logger.info(f'run_code: job_id={job.id} before db_result')
+        return CodeResponse(stdout='', stderr='wait_container error', exit_code=9003, time=-1, debug={})
+    
+    client.api.remove_container(container_id, force=True) 
     try:
         db = SessionLocal()
         job_result = db.query(CodeJob).filter(CodeJob.id == job.id).first()
         db.close()
-        logger.info(f'run_code: job_id={job.id} after db_result')
         if job_result:
             return CodeResponse(
                 stdout=job_result.result_stdout or '',
                 stderr=job_result.result_stderr or '',
                 exit_code=job_result.result_exit_code if job_result.result_exit_code is not None else -1,
                 time=job_result.result_time if job_result.result_time is not None else -1,
-                debug={'job_id': job.id, 'container_id': container_id}
+                debug={}
             )
         else:
-            return CodeResponse(stdout='', stderr='No result in DB', exit_code=9999, time=-1, debug={'job_id': job.id, 'container_id': container_id})
+            return CodeResponse(stdout='', stderr='No result in DB', exit_code=9999, time=-1, debug={})
     except Exception as e:
-        logger.error(f'db_result error: {e}', exc_info=True)
-        return CodeResponse(stdout='', stderr='db_result error', exit_code=9004, time=-1, debug={'job_id': job.id, 'container_id': container_id})
+        return CodeResponse(stdout='', stderr='db_result error', exit_code=9004, time=-1, debug={})
 
 @app.get("/dbtest", response_model=CodeResponse)
 def dbtest():

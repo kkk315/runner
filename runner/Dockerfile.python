@@ -1,3 +1,5 @@
+# リソース制限環境変数（runner-python用）
+
 FROM python:3.11-slim
 
 ARG TARGET_UID=1000
@@ -19,8 +21,13 @@ RUN pip install --no-cache-dir \
     SQLAlchemy \
     PyYAML \
     psycopg2-binary
+
 WORKDIR /home/runner/
 COPY run.py /home/runner/run.py
 RUN chmod +x /home/runner/run.py
 USER runner
+
+# リソース制限環境変数（runner-python用）
+ENV CONTAINER_MAX_MEM=512m
+ENV CONTAINER_MAX_CPU=1.0
 
