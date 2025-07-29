@@ -31,7 +31,7 @@ mem_limit: 2g  # 例: 512m, 1g, 2g
 cpu_limit: 1.0  # 例: 1.0, 0.5
 
 #テスト用DB接続設定
-db_host: db
+db_host: localhost
 db_port: 5432
 db_user: youruser
 db_password: yourpassword

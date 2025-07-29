@@ -138,8 +138,13 @@ def run_code(req: CodeRequest):
         with open(seccomp_path, 'r') as f:
             seccomp_json = f.read()
         security_opt = [f"seccomp={seccomp_json}"]
+    dev_mode = os.getenv('DEV', '').lower() == 'true'
+    if dev_mode:
+        network_mode = 'host'
+    else:
+        network_mode = 'runner_backend-db-net'
     host_config = client.api.create_host_config(
-        network_mode='runner_backend-db-net',  
+        network_mode=network_mode,
         mem_limit=mem_limit,
         nano_cpus=int(cpu_limit * 1e9),
         security_opt=security_opt
@@ -151,18 +156,8 @@ def run_code(req: CodeRequest):
     ext = ext_map.get(req.language, req.language)
     start = pytime.time()
 
-    def read_secret(path, default):
-        try:
-            with open(path, 'r') as f:
-                return f.read().strip()
-        except Exception:
-            return default
-
-    db_user = read_secret('/run/secrets/DBUSER', 'exampleuser')
-    db_password = read_secret('/run/secrets/DBPASSWORD', 'examplepass')
-    db_name = read_secret('/run/secrets/DBNAME', 'exampledb')
-    db_host = 'db'  # HOST名は必ずサービス名 'db' を使う
-    db_port = '5432'
+    from db import get_db_config
+    db_user, db_password, db_name, db_host, db_port = get_db_config()
     try:
         cmd_str = " ".join([str(x) for x in [job.id, db_user, db_password, db_name, db_host, db_port]])
         container = client.api.create_container(
