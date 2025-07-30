@@ -142,7 +142,8 @@ def run_code(req: CodeRequest):
     if dev_mode:
         network_mode = 'host'
     else:
-        network_mode = 'runner_backend-db-net'
+        stack_name = os.getenv('STACK_NAME')
+        network_mode = f'{stack_name}_backend-db-net'
     host_config = client.api.create_host_config(
         network_mode=network_mode,
         mem_limit=mem_limit,

@@ -1,5 +1,6 @@
+
 import React, { useState } from 'react';
-import CodeEditor from './components/CodeEditor.tsx';
+import CodeEditor from './components/CodeEditor';
 import StdinInput from './components/StdinInput';
 import Layout from './components/Layout';
 import ResultPanel from './components/ResultPanel';
@@ -12,7 +13,6 @@ interface CodeResult {
   time?: number;
   debug?: any;
 }
-
 
 function renderTemplate(params: {
   language: string;

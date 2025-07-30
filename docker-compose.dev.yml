@@ -2,18 +2,24 @@ version: '3.8'
 
 services:
   frontend:
-    image: runner-frontend:latest
+    image: node:24.4.1-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host"
     ports:
-      - "80:80"
+      - "5173:5173"
     networks:
       - frontend-net
     depends_on:
       - backend
     environment:
-      - NODE_ENV=production
+      - NODE_ENV=development
+    volumes:
+      - ./frontend:/app
 
   backend:
-    image: runner-backend:latest
+    image: python:3.12-slim
+    working_dir: /app
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
     ports:
       - "8000:8000"
     networks:
@@ -22,15 +28,17 @@ services:
     depends_on:
       - db
     environment:
+      - PYTHONUNBUFFERED=1
       - DBUSER_FILE=/run/secrets/DBUSER
       - DBPASSWORD_FILE=/run/secrets/DBPASSWORD
       - DBNAME_FILE=/run/secrets/DBNAME
-      - STACK_NAME=runner
+      - STACK_NAME=runner-dev
     secrets:
       - DBUSER
       - DBPASSWORD
       - DBNAME
     volumes:
+      - ./backend:/app
       - /var/run/docker.sock:/var/run/docker.sock
 
   db:
@@ -47,7 +55,7 @@ services:
       - DBPASSWORD
       - DBNAME
     volumes:
-      - db-data:/var/lib/postgresql/data
+      - db-data:/var/lib/postgresql/data-dev
 
 secrets:
   DBUSER:

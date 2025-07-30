@@ -4,10 +4,6 @@ interface LayoutProps {
   children: React.ReactNode;
 }
 
-/**
- * アプリ全体の共通レイアウト
- * ヘッダー・フッター・共通スタイル等をここで定義
- */
 const Layout: React.FC<LayoutProps> = ({ children }) => {
   return (
     <div style={{ minHeight: '100vh', background: '#f7f7f7' }}>
